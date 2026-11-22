@@ -1,0 +1,297 @@
+package com.miu.usbtether
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.ElevatedCard
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedCard
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.dp
+import com.miu.usbtether.ui.theme.MyApplicationTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent {
+            MyApplicationTheme {
+                Surface(modifier = Modifier.fillMaxSize()) {
+                    TetherScreen()
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun TetherScreen() {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    var rootOk by remember { mutableStateOf<Boolean?>(null) }
+    var on by remember { mutableStateOf(false) }
+    var info by remember { mutableStateOf("") }
+    var battery by remember { mutableStateOf("") }
+    var powerMode by remember { mutableStateOf("?") }
+    var selMode by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var log by remember { mutableStateOf("") }
+    var autoBoot by remember { mutableStateOf(false) }
+
+    suspend fun refresh() {
+        val ok = withContext(Dispatchers.IO) { TetherCore.hasRoot() }
+        rootOk = ok
+        if (ok) {
+            on = withContext(Dispatchers.IO) { TetherCore.isOn() }
+            info = withContext(Dispatchers.IO) { TetherCore.statusText() }
+            battery = withContext(Dispatchers.IO) { TetherCore.batteryInfo() }
+            powerMode = withContext(Dispatchers.IO) { TetherCore.currentPowerRole() }
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        autoBoot = TetherCore.autoBootEnabled(ctx)
+        refresh()
+    }
+
+    Scaffold { pad ->
+        Column(
+            modifier = Modifier
+                .padding(pad)
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(20.dp)
+        ) {
+            Text("USB 网络共享", style = MaterialTheme.typography.headlineMedium)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "手机 ⇄ iPad · 通过 OTG 走有线（NCM）共享网络",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            // ---------- 状态 ----------
+            Spacer(Modifier.height(16.dp))
+            ElevatedCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp)) {
+                    Text(
+                        text = if (on) "● 共享中" else "○ 未开启",
+                        style = MaterialTheme.typography.titleLarge
+                    )
+                    Spacer(Modifier.height(8.dp))
+
+                    val modeDesc = when (powerMode) {
+                        "source" -> "手机给 iPad 供电"
+                        "sink" -> "iPad 给手机供电"
+                        else -> "未知"
+                    }
+                    val rootText = when (rootOk) {
+                        true -> "已授权"
+                        false -> "未授权"
+                        null -> "检测中…"
+                    }
+                    Text("供电：$modeDesc　·　root：$rootText", style = MaterialTheme.typography.bodySmall)
+                    if (battery.isNotBlank()) {
+                        Spacer(Modifier.height(2.dp))
+                        Text("电量：$battery", style = MaterialTheme.typography.bodySmall)
+                    }
+                    if (info.isNotBlank()) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = info,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+
+            // ---------- 主开关 ----------
+            Spacer(Modifier.height(16.dp))
+            Button(
+                onClick = {
+                    if (!busy) {
+                        scope.launch {
+                            busy = true
+                            log = ""
+                            val target = !on
+                            log = withContext(Dispatchers.IO) {
+                                TetherCore.setEnabledBlocking(ctx, target)
+                            }.takeLast(600)
+                            refresh()
+                            busy = false
+                        }
+                    }
+                },
+                enabled = !busy,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp)
+            ) {
+                Text(
+                    when {
+                        busy -> "执行中…（切换 USB 模式约需数秒）"
+                        on -> "关闭共享"
+                        else -> "开启共享"
+                    }
+                )
+            }
+
+            // ---------- 供电方向 ----------
+            Spacer(Modifier.height(20.dp))
+            Text("供电方向", style = MaterialTheme.typography.titleSmall)
+            Spacer(Modifier.height(2.dp))
+            Text(
+                "切换不会中断网络，只是重新协商 USB 供电",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val modes = listOf(
+                    "sink" to "iPad→手机",
+                    "source" to "手机→iPad",
+                    "off" to "都不供电"
+                )
+                for (m in modes) {
+                    val selected = if (m.first == "off") {
+                        selMode == "off"
+                    } else {
+                        selMode == m.first || (selMode.isBlank() && powerMode == m.first)
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            if (!busy) {
+                                scope.launch {
+                                    busy = true
+                                    log = ""
+                                    selMode = m.first
+                                    log = withContext(Dispatchers.IO) {
+                                        TetherCore.setPowerModeBlocking(ctx, m.first)
+                                    }.takeLast(300)
+                                    refresh()
+                                    busy = false
+                                }
+                            }
+                        },
+                        enabled = !busy
+                    ) {
+                        Text(
+                            text = m.second,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (selected) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+            }
+
+            // ---------- 开机自启 ----------
+            Spacer(Modifier.height(12.dp))
+            OutlinedCard(Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("开机自动开启", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "开机约 20 秒后自动执行，需 iPad 已连接",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = autoBoot,
+                        onCheckedChange = {
+                            autoBoot = it
+                            TetherCore.setAutoBoot(ctx, it)
+                        }
+                    )
+                }
+            }
+
+            // ---------- iPad 端 ----------
+            Spacer(Modifier.height(16.dp))
+            OutlinedCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("iPad 端设置", style = MaterialTheme.typography.titleSmall)
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "设置 → 以太网 → 配置 IP：手动\n" +
+                            "IP：192.168.42.30\n" +
+                            "子网掩码：255.255.255.0\n" +
+                            "路由器：192.168.42.129\n" +
+                            "DNS：8.8.8.8",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "断线保护：iPad 断开约 20 秒后会自动关闭并清理规则",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "加磁贴：下拉通知栏 → 编辑 → 把「网络共享」拖进快捷面板",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            // ---------- 输出 ----------
+            if (log.isNotBlank()) {
+                Spacer(Modifier.height(14.dp))
+                OutlinedCard(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text("执行输出", style = MaterialTheme.typography.labelMedium)
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            log,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(24.dp))
+        }
+    }
+}

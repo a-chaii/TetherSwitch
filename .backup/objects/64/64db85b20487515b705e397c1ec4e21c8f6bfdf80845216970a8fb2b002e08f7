@@ -1,0 +1,89 @@
+package com.miu.usbtether
+
+import android.content.Context
+import java.io.File
+import java.util.concurrent.TimeUnit
+
+/**
+ * USB 网络共享核心：所有需要 root 的操作都走这里。
+ */
+object TetherCore {
+
+    private const val DIR = "/data/local/tmp"
+    const val ON_SCRIPT = "$DIR/usb_tether.sh"
+    const val OFF_SCRIPT = "$DIR/usb_tether_off.sh"
+    const val POWER_SCRIPT = "$DIR/tether_power.sh"
+
+    /** 执行 root 命令，返回合并后的输出（超时返回 TIMEOUT） */
+    fun su(cmd: String, timeoutMs: Long = 240_000): String {
+        return try {
+            val pb = ProcessBuilder("su", "-c", cmd)
+            pb.redirectErrorStream(true)
+            val p = pb.start()
+            val sb = StringBuilder()
+            val reader = Thread {
+                try {
+                    p.inputStream.bufferedReader().forEachLine { sb.appendLine(it) }
+                } catch (_: Throwable) {
+                }
+            }
+            reader.start()
+            val finished = p.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+            if (!finished) {
+                p.destroyForcibly()
+                "TIMEOUT"
+            } else {
+                reader.join(3000)
+                sb.toString().trim()
+            }
+        } catch (e: Throwable) {
+            "ERR: " + (e.message ?: e.javaClass.simpleName)
+        }
+    }
+
+    /** 是否已获得 root 授权 */
+    fun hasRoot(): Boolean = su("id -u", 15_000).trim() == "0"
+
+    /** 共享是否处于开启状态（以 usb0 的 carrier 为准） */
+    fun isOn(): Boolean =
+        su("cat /sys/class/net/usb0/carrier 2>/dev/null", 15_000).trim() == "1"
+
+    /** 采集状态文本 */
+    fun statusText(): String = su(
+        "c=\$(cat /sys/class/net/usb0/carrier 2>/dev/null); " +
+            "a=\$(ip -o -4 addr show usb0 2>/dev/null | awk '{print \$4}'); " +
+            "u=\$(ip route show table all 2>/dev/null | awk '/default/ && /rmnet_data/ {for(i=1;i<=NF;i++) if(\$i==\"dev\"){print \$(i+1); exit}}'); " +
+            "t=\$(getprop sys.usb.state); " +
+            "echo \"carrier=\$c ip=\$a up=\$u usb=\$t\"",
+        15_000
+    ).trim()
+
+    /** 把 assets 里的脚本写到 /data/local/tmp 并赋可执行权限 */
+    fun ensureScripts(ctx: Context): Boolean {
+        val a = writeAsset(ctx, "tether_on.sh", ON_SCRIPT)
+        val b = writeAsset(ctx, "tether_off.sh", OFF_SCRIPT)
+        val c = writeAsset(ctx, "tether_power.sh", POWER_SCRIPT)
+        return a && b && c
+    }
+
+    private fun writeAsset(ctx: Context, name: String, dest: String): Boolean {
+        return try {
+            val txt = ctx.assets.open(name).bufferedReader().use { it.readText() }
+            val f = File(ctx.filesDir, name)
+            f.writeText(txt)
+            val out = su(
+                "cp '" + f.absolutePath + "' '" + dest + "' && chmod 755 '" + dest + "' && echo OK",
+                30_000
+            )
+            out.contains("OK")
+        } catch (e: Throwable) {
+            false
+        }
+    }
+
+    /** 开关（阻塞调用，请放到后台线程） */
+    fun setEnabledBlocking(ctx: Context, on: Boolean): String {
+        if (!ensureScripts(ctx)) return "ERR: 脚本写入失败（root 未授权？）"
+        return su("sh " + (if (on) ON_SCRIPT else OFF_SCRIPT))
+    }
+}

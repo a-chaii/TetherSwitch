@@ -1,0 +1,184 @@
+package com.miu.usbtether
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.ElevatedCard
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedCard
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.dp
+import com.miu.usbtether.ui.theme.MyApplicationTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent {
+            MyApplicationTheme {
+                Surface(modifier = Modifier.fillMaxSize()) {
+                    TetherScreen()
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun TetherScreen() {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    var rootOk by remember { mutableStateOf<Boolean?>(null) }
+    var on by remember { mutableStateOf(false) }
+    var info by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var log by remember { mutableStateOf("") }
+    var powerMode by remember { mutableStateOf("?") }
+    var selMode by remember { mutableStateOf("") }
+
+    suspend fun refresh() {
+        val r = withContext(Dispatchers.IO) {
+            val ok = TetherCore.hasRoot()
+            val state = if (ok) TetherCore.isOn() else false
+            val text = if (ok) TetherCore.statusText() else "无 root 权限"
+            Triple(ok, state, text)
+        }
+        rootOk = r.first
+        on = r.second
+        info = r.third
+        powerMode = if (r.first) {
+            withContext(Dispatchers.IO) { TetherCore.currentPowerRole() }
+        } else {
+            "?"
+        }
+    }
+
+    LaunchedEffect(Unit) { refresh() }
+
+    Scaffold { pad ->
+        Column(
+            modifier = Modifier
+                .padding(pad)
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(20.dp)
+        ) {
+            Text("USB 网络共享", style = MaterialTheme.typography.headlineMedium)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "通过 OTG 把手机网络共享给 iPad（NCM 模式）",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Spacer(Modifier.height(16.dp))
+            ElevatedCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp)) {
+                    Text(
+                        text = if (on) "● 已开启" else "○ 未开启",
+                        style = MaterialTheme.typography.titleLarge
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    val rootText = when (rootOk) {
+                        true -> "已授权"
+                        false -> "未授权"
+                        null -> "检测中…"
+                    }
+                    Text("root：" + rootText, style = MaterialTheme.typography.bodyMedium)
+                    if (info.isNotBlank()) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = info,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+            Button(
+                onClick = {
+                    if (!busy) {
+                        scope.launch {
+                            busy = true
+                            log = ""
+                            val target = !on
+                            log = withContext(Dispatchers.IO) {
+                                TetherCore.setEnabledBlocking(ctx, target)
+                            }.takeLast(800)
+                            refresh()
+                            busy = false
+                        }
+                    }
+                },
+                enabled = !busy,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp)
+            ) {
+                Text(if (busy) "执行中…" else if (on) "关闭共享" else "开启共享")
+            }
+
+            Spacer(Modifier.height(16.dp))
+            OutlinedCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("iPad 端设置", style = MaterialTheme.typography.titleSmall)
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "设置 → 以太网 → 配置 IP：手动\n" +
+                            "IP：192.168.42.30\n" +
+                            "子网掩码：255.255.255.0\n" +
+                            "路由器：192.168.42.129\n" +
+                            "DNS：8.8.8.8",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "加磁贴：下拉通知栏 → 编辑 → 把「网络共享」拖进快捷面板",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            if (log.isNotBlank()) {
+                Spacer(Modifier.height(12.dp))
+                Text("输出", style = MaterialTheme.typography.labelMedium)
+                Spacer(Modifier.height(4.dp))
+                Text(log, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
+            }
+            Spacer(Modifier.height(24.dp))
+        }
+    }
+}

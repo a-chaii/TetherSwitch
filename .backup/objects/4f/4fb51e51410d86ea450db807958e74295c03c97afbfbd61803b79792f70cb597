@@ -1,0 +1,76 @@
+#!/system/bin/sh
+# ============================================================
+# USB 网络共享 (NCM) 一键开启 —— 手机通过 OTG 给 iPad 上网
+# 可重复执行（幂等）
+# ============================================================
+set +e
+
+USBIF=usb0
+UP="$1"
+
+say() { echo "[tether] $*"; }
+
+# ---------- 0. 自动检测上行接口 ----------
+if [ -z "$UP" ]; then
+  UP=$(ip -o route show table all 2>/dev/null | awk '/default/ && /rmnet_data/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+  [ -z "$UP" ] && UP=rmnet_data2
+fi
+say "上行接口 = $UP"
+
+# ---------- 1. 把 USB gadget 切成 NCM ----------
+if [ "$(getprop sys.usb.state)" != "ncm" ]; then
+  say "切换 USB gadget -> NCM ..."
+  svc usb setFunctions ncm >/dev/null 2>&1
+  i=0
+  while [ $i -lt 120 ]; do
+    [ -d /sys/class/net/$USBIF ] && break
+    sleep 1; i=$((i+1))
+  done
+fi
+
+# ---------- 2. 网卡 up，等 carrier ----------
+ip link set $USBIF up 2>/dev/null
+i=0
+while [ $i -lt 60 ]; do
+  [ "$(cat /sys/class/net/$USBIF/carrier 2>/dev/null)" = "1" ] && break
+  sleep 1; i=$((i+1))
+done
+say "carrier=$(cat /sys/class/net/$USBIF/carrier 2>/dev/null)"
+
+# ---------- 3. 下联口地址 ----------
+ip addr replace 192.168.42.129/24 dev $USBIF
+
+# ---------- 4. 开启 IPv4 转发 ----------
+echo 1 > /proc/sys/net/ipv4/ip_forward
+say "ip_forward=$(cat /proc/sys/net/ipv4/ip_forward)"
+
+# ---------- 5. NAT + FORWARD ----------
+iptables -t nat -C tetherctrl_nat_POSTROUTING -o $UP -j MASQUERADE 2>/dev/null || \
+  iptables -t nat -A tetherctrl_nat_POSTROUTING -o $UP -j MASQUERADE
+iptables -C tetherctrl_FORWARD -i $USBIF -o $UP -j ACCEPT 2>/dev/null || \
+  iptables -I tetherctrl_FORWARD -i $USBIF -o $UP -j ACCEPT
+iptables -C tetherctrl_FORWARD -i $UP -o $USBIF -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+  iptables -I tetherctrl_FORWARD -i $UP -o $USBIF -m state --state RELATED,ESTABLISHED -j ACCEPT
+say "NAT/FORWARD 就绪"
+
+# ---------- 6. 策略路由 ----------
+ip rule del iif $USBIF lookup $UP pref 20500 2>/dev/null
+ip rule add iif $USBIF lookup $UP pref 20500 2>/dev/null
+ip rule del iif $UP lookup main pref 20400 to 192.168.42.0/24 2>/dev/null
+ip rule add iif $UP lookup main pref 20400 to 192.168.42.0/24 2>/dev/null
+say "策略路由就绪"
+
+# ---------- 7. DHCP（可选） ----------
+pkill -f "dnsmasq --interface=$USBIF" 2>/dev/null
+nohup /system/bin/dnsmasq --interface=$USBIF \
+  --dhcp-range=192.168.42.2,192.168.42.254,255.255.255.0,1h \
+  --dhcp-option=3,192.168.42.129 \
+  --dhcp-option=6,8.8.8.8,223.5.5.5 \
+  --port=0 --dhcp-authoritative \
+  --pid-file=/data/local/tmp/dns.pid \
+  --dhcp-leasefile=/data/local/tmp/leases \
+  >/data/local/tmp/dns.log 2>&1 &
+say "dnsmasq 已启动"
+
+say "配置完成"
+ip -o -4 addr show $USBIF
