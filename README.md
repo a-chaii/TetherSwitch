@@ -1,194 +1,166 @@
 # TetherSwitch
 
-> 手动切换「有线网络共享」模式：一根 USB 线，让 Android 手机的网络共享给 **iPad、iPhone 或 macOS**。
-> 面向那些 **TetheringManager 不会自动接管 NCM 下游接口** 的 ROM（例如 ColorOS/部分 OPPO 机型），
-> 补上完整的手工网络栈、供电方向控制和断线自愈。**需要 root。**
+插上线，iPad 就能上网。
 
-📄 [实测原理](./docs/PRINCIPLES.md) · 🔧 [排错手册](./docs/TROUBLESHOOTING.md) · 📱 [兼容性](./docs/COMPATIBILITY.md)
+先说为什么会有这个东西。
 
----
+Android 的 USB 网络共享默认走 RNDIS。而苹果那边——macOS、iOS、iPadOS——从来没做过 RNDIS 的主机驱动，一个都没有。所以你把数据线插到 iPad 上、把「USB 网络共享」打开，iPad 那边连个以太网口都不会冒出来。不是你没设置对，是这条路压根不通。
 
-## 为什么还需要一个
+能通的是 CDC-NCM。把手机的 USB gadget 从 RNDIS 切成 NCM，iPad 就会把线对面当成一块普通有线网卡。到这里为止都挺顺。
 
-iPad/iPhone/macOS **从来不支持 RNDIS**，而 Android 的 USB 共享默认就是 RNDIS，所以插上以后 iPad 连“以太网”都不会出现。
-把 gadget 切成 **CDC-NCM** 是第一步，但很多 ROM 走到这里还有第二道坎：**系统的 Tethering 状态机根本不会接管新出现的 NCM 接口**。
+不顺的是下一步。
 
-现有项目大多假设“系统会自己配好”，因此只做“切模式”这一件事：
+## 分岔路口
 
-| 项目 | 做了什么 | 我们的差异 |
-|---|---|---|
-| [DurkaEbanaya/usb-tether-mode-switcher](https://github.com/DurkaEbanaya/usb-tether-mode-switcher) | root App，写 `tether_force_usb_functions` 0/1 | 只切模式；不管 IP/NAT/DHCP |
-| [lipangeng/kernelsu-auto-ncm](https://github.com/lipangeng/kernelsu-auto-ncm) | KernelSU 模块，RNDIS 进入 TetheredState 后切 NCM | 依赖系统自动接管 `usb1` |
-| [dcode-co/android-usb-tethering-ncm](https://github.com/dcode-co/android-usb-tethering-ncm) | Redmi→macOS 脚本 + 大量实测笔记 | 同样依赖系统接管 |
-| [frosty-universe/usb-android-tethering](https://github.com/frosty-universe/usb-android-tethering) | macOS 侧 Rust 用户态驱动 | host 端方案 |
+有些 ROM 会自己把活干完：新的 `usb0` 一出现，Tethering 服务就接管，配地址、起 DHCP、建 NAT，你插线开共享就行，剩下的它包了。
 
-**本项目补的是“系统不接管”这一档**：
+运气好是这类机器的话，别用我这个，用下面这些更省事：
 
-- `dumpsys tethering` 显示 `Upstream wanted: false` 时，手工配置 `usb0` 地址、NAT、FORWARD、DHCP
-- 尤其是**两条策略路由**（出向 + 回程）——少了它们，包一定出不去/回不来
-- 额外做了**供电方向**（解决“平板给手机供电但净掉电”）与**看门狗**（断线清理 / 上行切换 / 地址自愈）
+- [lipangeng/kernelsu-auto-ncm](https://github.com/lipangeng/kernelsu-auto-ncm) —— KernelSU 模块，等原厂 RNDIS 真的进到共享状态后切 NCM，Moto 上验证过
+- [DurkaEbanaya/usb-tether-mode-switcher](https://github.com/DurkaEbanaya/usb-tether-mode-switcher) —— 小 App，改 `tether_force_usb_functions` 切模式
+- [dcode-co/android-usb-tethering-ncm](https://github.com/dcode-co/android-usb-tethering-ncm) —— 红米→macOS，踩坑记录写得很细，HyperOS 会回滚 `svc setFunctions` 这件事就是从他那儿知道的
 
-如果你的机型系统会自动接管 NCM（看到 `usb0 - TetheredState`），那**直接用上面那几个项目更省事**，本项目的手工配置对你是多余的。
+我这台不在其中。
 
----
+OPPO PJX110，ColorOS 16。切完 NCM，`dumpsys tethering` 很干脆：
 
-## 特性
-
-- ✅ 一键切换 NCM + 完整网络栈（地址 / 转发 / NAT / 策略路由 / DHCP）
-- ✅ **自动识别上行**（`wlan0` / `rmnet_dataX`），WiFi 与移动数据切换时自动迁移规则
-- ✅ **供电方向三档**：iPad→手机、手机→iPad、**都不供电**（OPPO 平台）
-- ✅ **看门狗**：断线约 20 秒自动清理；接口重建后地址丢失自动补回
-- ✅ **Quick Settings 磁贴** + 开机自启开关 + 电量/上行/守护进程状态展示
-- ✅ 纯脚本也能用，不装 App 同样工作
-
----
-
-## 适用条件（先自检）
-
-```sh
-su -c '
-ls /config/usb_gadget/g1/functions/ | grep -E "ncm|rndis"
-dumpsys tethering | grep -E "tetherableNcm|tetherableUsb"
-'
+```
+Tether state:
+  Upstream wanted: false
 ```
 
-- 有 `ncm.*` 函数（如 `ncm.gs6`）→ 有戏
-- `tetherableNcmRegexs` 非空（如 `[ncm\d]`）→ 更好
-- **必须 root**（KernelSU / Magisk / 其他 su 实现）
+翻译成人话：系统不打算管这个接口。地址不给，DHCP 不起，NAT 不建，iptables 一条不动。接口是我切出来的，烂摊子也得我收。
 
----
+## 卡住我的那一晚上
 
-## 快速开始
+手动配完地址和 NAT，`iptables` 的计数一动不动。抓包一看，iPad 在发 SYN，`usb0` 上有，上行口没有。
 
-### 方式 A：脚本（无需装 App）
+查了半天：
+
+```
+ip route get 223.5.5.5 from 192.168.42.30 iif usb0
+→ Network is unreachable
+```
+
+`main` 表里是空的。Android 不用传统的默认路由，它靠 fwmark 和一堆策略表，默认路由住在 `rmnet_data2`、`wlan0` 这些以接口命名的表里。转发的包 `fwmark=0`，一路走到 `32000: from all unreachable`，然后被扔掉。
+
+加了一条 `iif usb0 lookup <上行>`，包出去了。但 iPad 还是打不开网页。
+
+再抓：SYN 出去了，对端 SYN-ACK 也回来了，可 iPad 收不到，手机反而在朝外发 `ICMP net unreachable`。回程的包同样落到了 unreachable 上。又加一条只针对 `192.168.42.0/24` 的回程规则，`iif <上行> lookup main`。
+
+然后就通了。抓包里第一次看到 `17.57.145.134.5223` 和 iPad 正常握手的时候，说实话挺爽的。
+
+这两条规则（出向 `20500`、回程 `20400`）后来成了这个仓库里最要紧的东西。原理写在 [docs/PRINCIPLES.md](docs/PRINCIPLES.md)，不想听故事可以直接去那儿看。
+
+## 里面有什么
+
+`scripts/` 是四个纯 shell 脚本，不装 App 也能用。`app/` 是个带控制中心磁贴的安卓 App，纯粹因为我实在不想每次都开终端敲 `su -c`。
+
+脚本做的事：
+
+- 切 NCM，把 `usb0` up 起来（不 up 的话 carrier 一直是 0，会以为是线的问题）
+- 配地址、开转发、NAT、双向 FORWARD
+- 加那两条策略路由
+- 起 dnsmasq
+- 挂一个看门狗
+
+看门狗是被坑出来的。有次手机连的是 WiFi，而脚本里上行写死了 `rmnet_data2`，iPad 上一秒有网下一秒断。现在上行是自动探测的，`wlan0` 优先。顺带它还管两件事：线拔了超过 20 秒自动收摊切回 MTP；接口被系统重建、地址丢了，它自己补回去。
+
+App 比脚本多的：磁贴、电量、开机自启（默认关）、供电方向。
+
+## 供电方向
+
+iPad 插上来会主动给手机供电。但它给的那点电流不够手机花，结果就是电池一路往下掉，「在充电」和「在掉电」同时成立。
+
+翻了半天找到两个节点：`/sys/class/typec/port0/power_role` 可以写 `sink`/`source`，OPPO 还有个私有的 `otg_switch`。
+
+| 想要的 | 怎么弄 |
+|---|---|
+| iPad 给手机供电 | `power_role=sink`，`otg_switch=1` |
+| 手机给 iPad 供电 | `power_role=source`，`otg_switch=1` |
+| 谁也别供 | 先 `source`，等一秒，再 `otg_switch=0` |
+
+最后那档的顺序不能反，先声明 `source` 让对面停止送电，再关掉自己的输出，网不会断。
+
+这一段只在 OPPO 上验过。`power_role` 是标准 Type-C 属性，各家应该都有；`otg_switch` 是 OPPO 私有的，别的厂商得去找自己充电驱动里的对应节点。脚本里写的是「找不到就跳过」，不会卡住。
+
+## 怎么用
+
+只有脚本的话，把 `scripts/` 推到手机：
 
 ```sh
-# 1. 把 scripts/ 下的 4 个文件推到手机
 adb push scripts/ /data/local/tmp/
 adb shell su -c 'chmod 755 /data/local/tmp/scripts/*.sh'
-
-# 2. 开启（自动检测上行）
 adb shell su -c 'sh /data/local/tmp/scripts/tether_on.sh'
-
-# 3. 关闭
-adb shell su -c 'sh /data/local/tmp/scripts/tether_off.sh'
 ```
 
-### 方式 B：App（带控制中心磁贴）
+上行会自己找，不用传参。关掉用 `tether_off.sh`。
 
-```
+要 App 的话：
+
+```sh
 ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-App 首次点按会把脚本写入 `/data/local/tmp/`。之后下拉控制中心 → 编辑 → 添加「网络共享」磁贴即可一键开关。
+装完下拉控制中心，编辑磁贴，把「网络共享」拖进去。
 
-> 构建环境：JDK 17 + Android SDK（platform 35 / build-tools 36）。
-> ARM64 Linux 下官方 `aapt2` 不可用，本项目 `tools/aapt2` 为 arm64 版本，`setup_android_env.sh` 会自动替换。
+顺手记一句构建的坑：官方 `aapt2` 在 arm64 Linux 上跑不了，仓库里 `tools/aapt2` 是 ReVanced 编译的 arm64 版本，`setup_android_env.sh` 会把它换上去。我一开始不知道，浪费了一晚上在报错上。
 
-### iPad 端
+## iPad 那边
 
-设置 → 以太网 → 配置 IP：**手动**
+设置 → 以太网 → 配置 IP → 手动：
 
-| 项 | 值 |
-|---|---|
 | IP 地址 | `192.168.42.30` |
+|---|---|
 | 子网掩码 | `255.255.255.0` |
 | 路由器 | `192.168.42.129` |
 | DNS | `8.8.8.8` |
 
-（用 DHCP 也行，但 iOS 一旦 DHCP 失败会退化成 `169.254.x.x`，手动配最稳。）
+DHCP 也行，但你得接受 iOS 的脾气：一旦 DHCP 失败，它会自己退化到 `169.254.x.x`，然后不再请求 DHCP。看现象就是「以太网有了，但显示未连接」，很容易以为是自己配错了。手动填省事。
 
----
+## 说清楚不行的部分
 
-## 原理速览
+- **要 root。** 没 root 什么都干不了，iptables、ip rule、sysfs 全要。
+- **不是所有机型都行。** 内核 gadget 里没有 `ncm` 功能的，这条路直接堵死，只能走 WiFi 热点。
+- **切换会重建 gadget。** 正在跑的 adb 会断，传文件的时候别点。
+- **我这台 PJX110 在切 USB 功能时偶尔会把整机搞重启**，碰上过一次，`uptime` 从几分钟重新数。看着像这台机器 OTG 供电设计上的毛病，不是通病，但你要有心理准备。
+- **重启不保留。** 重启后回到 RNDIS，得重新开（或者把 App 里的开机自启打开）。
+- 有人说 `settings put global tether_force_usb_functions 1` 能让切换持久化。我这台没验证过，HyperOS 上确实有效（见上面 dcode-co 的记录），我把它写进排错手册当备选，不敢保证。
+- 不动 system/vendor，不改 `persist.sys.usb.config`。想还原就跑 `tether_off.sh`。
 
-```
-iPad ──USB(NCM)── usb0 (192.168.42.129/24)
-                    │  ip_forward=1
-                    ├─ iptables NAT  →  MASQUERADE  到上行
-                    ├─ ip rule 20500 → iif usb0 查上行表（出向）
-                    └─ ip rule 20400 → iif 上行 查 main（回程，目标 192.168.42.0/24）
-                                        │
-                                    wlan0 / rmnet_dataX  ← 真正的互联网出口
-```
+## 我这台的实测
 
-细节、实测数据与踩坑记录见 [docs/PRINCIPLES.md](./docs/PRINCIPLES.md)。
-
----
-
-## 供电方向（OPPO）
-
-| 选项 | 实现 | 效果 |
-|---|---|---|
-| iPad→手机 | `power_role=sink` + `otg_switch=1` | 平板给手机充电 |
-| 手机→iPad | `power_role=source` + `otg_switch=1` | 手机给平板供电 |
-| 都不供电 | `power_role=source` → `sleep 1` → `otg_switch=0` | 双方都不供，链路不断 |
-
-> `power_role` 是标准 Type-C class 属性；`otg_switch` 在 `/sys/class/oplus_chg/usb/` 下，属 OPPO 私有节点。
-> 其他厂商需要替换为对应充电驱动节点（脚本中已做失败静默处理）。
-
----
-
-## 风险与边界（请务必阅读）
-
-1. **需要 root**，无 root 完全不可用。
-2. **不是所有机型都行**。内核 gadget 必须有 NCM 功能、SELinux 不能拦、ROM 不能强制回滚 USB function。
-3. **切换 USB function 会重建 gadget**：连接中的 adb / usbmuxd 会中断，正在传输的文件会失败。
-4. **部分机型切换 USB 功能时可能出现 OTG 异常（甚至重启）**——本项目的测试机 PJX110 存在这一硬件/设计层面的问题，**不代表所有设备**，但请你自行评估风险。
-5. **不做持久化**：重启后 NCM 会回到 RNDIS，需要重新执行（或打开 App 的「开机自动开启」）。
-6. `tether_force_usb_functions`（持久切换）在本机**未验证**，仅作为部分 ROM 的备选写进文档。
-7. 本项目**不修改** system/vendor 分区，不改 `persist.sys.usb.config`，所有改动可通过 `tether_off.sh` 还原。
-
----
-
-## 实测环境
-
-| 项 | 值 |
+| | |
 |---|---|
-| 手机 | OPPO PJX110 · ColorOS 16 / Android 16 |
-| Root | KernelSU |
-| 平板 | iPad（iPadOS 27.3） |
-| 上行 | `wlan0`（WiFi）/ `rmnet_data2`（移动数据） |
-| 结果 | TCP 双向通，iPad 可正常浏览 |
+| 手机 | OPPO PJX110，ColorOS 16 / Android 16 |
+| root | KernelSU |
+| 平板 | iPad，iPadOS 27.3 |
+| 上行 | WiFi（`wlan0`）和移动数据（`rmnet_data2`）都试过 |
+| 结果 | TCP 双向通，Safari 正常 |
 
-其它机型请参考 [docs/COMPATIBILITY.md](./docs/COMPATIBILITY.md) 自检。
+别的机型我没试过，自检命令在 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)。
 
----
-
-## 目录结构
+## 文件
 
 ```
-├── app/                    # Android App（Compose UI + QS 磁贴 + BootReceiver）
-│   └── src/main/assets/    # 4 个 shell 脚本（随 App 部署）
-├── scripts/                # 独立可用的脚本版本
-│   ├── tether_on.sh        # 开启：切 NCM + 完整网络栈 + 起看门狗
-│   ├── tether_off.sh       # 关闭：清规则 + 恢复 MTP
-│   ├── tether_power.sh     # 供电方向（sink/source/off）
-│   └── tether_watch.sh     # 看门狗：断线清理 / 上行切换 / 地址自愈
-├── docs/                   # 原理、排错、兼容性
-├── tools/aapt2             # ARM64 aapt2（ReVanced 构建）
-└── setup_android_env.sh    # 构建环境准备
+app/                    App（Compose 界面 + 磁贴 + 开机广播）
+scripts/tether_on.sh    切 NCM、配网络栈、起看门狗
+scripts/tether_off.sh   清干净、回 MTP
+scripts/tether_power.sh 供电三档
+scripts/tether_watch.sh 看门狗
+docs/                   原理、排错、兼容性
+tools/aapt2             arm64 的 aapt2
 ```
 
----
+## 谢谢
 
-## 致谢
+- [ReVanced/aapt2](https://github.com/ReVanced/aapt2)，arm64 构建全靠它
+- 上面提到的那几个项目，尤其是 dcode-co 那篇记录，省了我不少时间
+- 还有帮我确认「iPad 不回 ping 是正常的」的那位，我差点又去改防火墙
 
-- [ReVanced/aapt2](https://github.com/ReVanced/aapt2) — ARM64 aapt2 二进制
-- 上面表格里的四个项目 — 提供了“切模式”和“ROM 回滚”的重要参考
-- 所有在 issue 里提供 `dumpsys` 与抓包的朋友
-
-## License
-
-[MIT](./LICENSE)
+MIT。
 
 ---
 
-## English TL;DR
-
-Share an Android phone's network to an **iPad / iPhone / macOS** over USB, by switching the USB gadget from RNDIS to **CDC-NCM** (Apple never implemented RNDIS).
-
-Unlike existing tools that only switch the gadget mode, this project also **builds the whole network stack by hand** for ROMs whose `TetheringManager` refuses to take over the NCM interface (`Upstream wanted: false`) — including the two policy-routing rules that are almost always the missing piece. It also adds USB **power-role control** and a **watchdog** (auto-cleanup on unplug, upstream migration on Wi-Fi/cellular switch, self-heal on interface re-creation).
-
-Requires root. Tested on OPPO PJX110 (ColorOS 16 / Android 16, KernelSU) → iPad (iPadOS 27.3). See [docs](./docs) for details.
+**English, briefly:** Android's USB tethering defaults to RNDIS, which Apple never supported. Switching the gadget to CDC-NCM makes the iPad see a normal Ethernet adapter. On phones whose TetheringManager then takes over, existing projects already solve it — use those. This repo is for the other case: the ROM leaves the NCM interface alone (`Upstream wanted: false`), so everything has to be done by hand, including the two policy-routing rules that most people miss. Tested on one phone (OPPO PJX110, ColorOS 16, KernelSU) with an iPad. Requires root. See [docs](docs).
