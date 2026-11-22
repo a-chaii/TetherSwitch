@@ -1,6 +1,6 @@
-# USB Tether (NCM) — 安卓手机给 iPad / iPhone / Mac 提供有线网络
+# TetherSwitch
 
-> 一根 USB 线，让 Android 手机的网络共享给 **iPad、iPhone 或 macOS**。
+> 手动切换「有线网络共享」模式：一根 USB 线，让 Android 手机的网络共享给 **iPad、iPhone 或 macOS**。
 > 面向那些 **TetheringManager 不会自动接管 NCM 下游接口** 的 ROM（例如 ColorOS/部分 OPPO 机型），
 > 补上完整的手工网络栈、供电方向控制和断线自愈。**需要 root。**
 

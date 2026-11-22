@@ -1,0 +1,196 @@
+# TetherSwitch — 手动切换「有线网络共享」模式
+
+# 安卓手机给 iPad / iPhone / Mac 提供有线网络（USB CDC-NCM）
+
+> 一根 USB 线，让 Android 手机的网络共享给 **iPad、iPhone 或 macOS**。
+> 面向那些 **TetheringManager 不会自动接管 NCM 下游接口** 的 ROM（例如 ColorOS/部分 OPPO 机型），
+> 补上完整的手工网络栈、供电方向控制和断线自愈。**需要 root。**
+
+📄 [实测原理](./docs/PRINCIPLES.md) · 🔧 [排错手册](./docs/TROUBLESHOOTING.md) · 📱 [兼容性](./docs/COMPATIBILITY.md)
+
+---
+
+## 为什么还需要一个
+
+iPad/iPhone/macOS **从来不支持 RNDIS**，而 Android 的 USB 共享默认就是 RNDIS，所以插上以后 iPad 连“以太网”都不会出现。
+把 gadget 切成 **CDC-NCM** 是第一步，但很多 ROM 走到这里还有第二道坎：**系统的 Tethering 状态机根本不会接管新出现的 NCM 接口**。
+
+现有项目大多假设“系统会自己配好”，因此只做“切模式”这一件事：
+
+| 项目 | 做了什么 | 我们的差异 |
+|---|---|---|
+| [DurkaEbanaya/usb-tether-mode-switcher](https://github.com/DurkaEbanaya/usb-tether-mode-switcher) | root App，写 `tether_force_usb_functions` 0/1 | 只切模式；不管 IP/NAT/DHCP |
+| [lipangeng/kernelsu-auto-ncm](https://github.com/lipangeng/kernelsu-auto-ncm) | KernelSU 模块，RNDIS 进入 TetheredState 后切 NCM | 依赖系统自动接管 `usb1` |
+| [dcode-co/android-usb-tethering-ncm](https://github.com/dcode-co/android-usb-tethering-ncm) | Redmi→macOS 脚本 + 大量实测笔记 | 同样依赖系统接管 |
+| [frosty-universe/usb-android-tethering](https://github.com/frosty-universe/usb-android-tethering) | macOS 侧 Rust 用户态驱动 | host 端方案 |
+
+**本项目补的是“系统不接管”这一档**：
+
+- `dumpsys tethering` 显示 `Upstream wanted: false` 时，手工配置 `usb0` 地址、NAT、FORWARD、DHCP
+- 尤其是**两条策略路由**（出向 + 回程）——少了它们，包一定出不去/回不来
+- 额外做了**供电方向**（解决“平板给手机供电但净掉电”）与**看门狗**（断线清理 / 上行切换 / 地址自愈）
+
+如果你的机型系统会自动接管 NCM（看到 `usb0 - TetheredState`），那**直接用上面那几个项目更省事**，本项目的手工配置对你是多余的。
+
+---
+
+## 特性
+
+- ✅ 一键切换 NCM + 完整网络栈（地址 / 转发 / NAT / 策略路由 / DHCP）
+- ✅ **自动识别上行**（`wlan0` / `rmnet_dataX`），WiFi 与移动数据切换时自动迁移规则
+- ✅ **供电方向三档**：iPad→手机、手机→iPad、**都不供电**（OPPO 平台）
+- ✅ **看门狗**：断线约 20 秒自动清理；接口重建后地址丢失自动补回
+- ✅ **Quick Settings 磁贴** + 开机自启开关 + 电量/上行/守护进程状态展示
+- ✅ 纯脚本也能用，不装 App 同样工作
+
+---
+
+## 适用条件（先自检）
+
+```sh
+su -c '
+ls /config/usb_gadget/g1/functions/ | grep -E "ncm|rndis"
+dumpsys tethering | grep -E "tetherableNcm|tetherableUsb"
+'
+```
+
+- 有 `ncm.*` 函数（如 `ncm.gs6`）→ 有戏
+- `tetherableNcmRegexs` 非空（如 `[ncm\d]`）→ 更好
+- **必须 root**（KernelSU / Magisk / 其他 su 实现）
+
+---
+
+## 快速开始
+
+### 方式 A：脚本（无需装 App）
+
+```sh
+# 1. 把 scripts/ 下的 4 个文件推到手机
+adb push scripts/ /data/local/tmp/
+adb shell su -c 'chmod 755 /data/local/tmp/scripts/*.sh'
+
+# 2. 开启（自动检测上行）
+adb shell su -c 'sh /data/local/tmp/scripts/tether_on.sh'
+
+# 3. 关闭
+adb shell su -c 'sh /data/local/tmp/scripts/tether_off.sh'
+```
+
+### 方式 B：App（带控制中心磁贴）
+
+```
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+App 首次点按会把脚本写入 `/data/local/tmp/`。之后下拉控制中心 → 编辑 → 添加「网络共享」磁贴即可一键开关。
+
+> 构建环境：JDK 17 + Android SDK（platform 35 / build-tools 36）。
+> ARM64 Linux 下官方 `aapt2` 不可用，本项目 `tools/aapt2` 为 arm64 版本，`setup_android_env.sh` 会自动替换。
+
+### iPad 端
+
+设置 → 以太网 → 配置 IP：**手动**
+
+| 项 | 值 |
+|---|---|
+| IP 地址 | `192.168.42.30` |
+| 子网掩码 | `255.255.255.0` |
+| 路由器 | `192.168.42.129` |
+| DNS | `8.8.8.8` |
+
+（用 DHCP 也行，但 iOS 一旦 DHCP 失败会退化成 `169.254.x.x`，手动配最稳。）
+
+---
+
+## 原理速览
+
+```
+iPad ──USB(NCM)── usb0 (192.168.42.129/24)
+                    │  ip_forward=1
+                    ├─ iptables NAT  →  MASQUERADE  到上行
+                    ├─ ip rule 20500 → iif usb0 查上行表（出向）
+                    └─ ip rule 20400 → iif 上行 查 main（回程，目标 192.168.42.0/24）
+                                        │
+                                    wlan0 / rmnet_dataX  ← 真正的互联网出口
+```
+
+细节、实测数据与踩坑记录见 [docs/PRINCIPLES.md](./docs/PRINCIPLES.md)。
+
+---
+
+## 供电方向（OPPO）
+
+| 选项 | 实现 | 效果 |
+|---|---|---|
+| iPad→手机 | `power_role=sink` + `otg_switch=1` | 平板给手机充电 |
+| 手机→iPad | `power_role=source` + `otg_switch=1` | 手机给平板供电 |
+| 都不供电 | `power_role=source` → `sleep 1` → `otg_switch=0` | 双方都不供，链路不断 |
+
+> `power_role` 是标准 Type-C class 属性；`otg_switch` 在 `/sys/class/oplus_chg/usb/` 下，属 OPPO 私有节点。
+> 其他厂商需要替换为对应充电驱动节点（脚本中已做失败静默处理）。
+
+---
+
+## 风险与边界（请务必阅读）
+
+1. **需要 root**，无 root 完全不可用。
+2. **不是所有机型都行**。内核 gadget 必须有 NCM 功能、SELinux 不能拦、ROM 不能强制回滚 USB function。
+3. **切换 USB function 会重建 gadget**：连接中的 adb / usbmuxd 会中断，正在传输的文件会失败。
+4. **部分机型切换 USB 功能时可能出现 OTG 异常（甚至重启）**——本项目的测试机 PJX110 存在这一硬件/设计层面的问题，**不代表所有设备**，但请你自行评估风险。
+5. **不做持久化**：重启后 NCM 会回到 RNDIS，需要重新执行（或打开 App 的「开机自动开启」）。
+6. `tether_force_usb_functions`（持久切换）在本机**未验证**，仅作为部分 ROM 的备选写进文档。
+7. 本项目**不修改** system/vendor 分区，不改 `persist.sys.usb.config`，所有改动可通过 `tether_off.sh` 还原。
+
+---
+
+## 实测环境
+
+| 项 | 值 |
+|---|---|
+| 手机 | OPPO PJX110 · ColorOS 16 / Android 16 |
+| Root | KernelSU |
+| 平板 | iPad（iPadOS 27.3） |
+| 上行 | `wlan0`（WiFi）/ `rmnet_data2`（移动数据） |
+| 结果 | TCP 双向通，iPad 可正常浏览 |
+
+其它机型请参考 [docs/COMPATIBILITY.md](./docs/COMPATIBILITY.md) 自检。
+
+---
+
+## 目录结构
+
+```
+├── app/                    # Android App（Compose UI + QS 磁贴 + BootReceiver）
+│   └── src/main/assets/    # 4 个 shell 脚本（随 App 部署）
+├── scripts/                # 独立可用的脚本版本
+│   ├── tether_on.sh        # 开启：切 NCM + 完整网络栈 + 起看门狗
+│   ├── tether_off.sh       # 关闭：清规则 + 恢复 MTP
+│   ├── tether_power.sh     # 供电方向（sink/source/off）
+│   └── tether_watch.sh     # 看门狗：断线清理 / 上行切换 / 地址自愈
+├── docs/                   # 原理、排错、兼容性
+├── tools/aapt2             # ARM64 aapt2（ReVanced 构建）
+└── setup_android_env.sh    # 构建环境准备
+```
+
+---
+
+## 致谢
+
+- [ReVanced/aapt2](https://github.com/ReVanced/aapt2) — ARM64 aapt2 二进制
+- 上面表格里的四个项目 — 提供了“切模式”和“ROM 回滚”的重要参考
+- 所有在 issue 里提供 `dumpsys` 与抓包的朋友
+
+## License
+
+[MIT](./LICENSE)
+
+---
+
+## English TL;DR
+
+Share an Android phone's network to an **iPad / iPhone / macOS** over USB, by switching the USB gadget from RNDIS to **CDC-NCM** (Apple never implemented RNDIS).
+
+Unlike existing tools that only switch the gadget mode, this project also **builds the whole network stack by hand** for ROMs whose `TetheringManager` refuses to take over the NCM interface (`Upstream wanted: false`) — including the two policy-routing rules that are almost always the missing piece. It also adds USB **power-role control** and a **watchdog** (auto-cleanup on unplug, upstream migration on Wi-Fi/cellular switch, self-heal on interface re-creation).
+
+Requires root. Tested on OPPO PJX110 (ColorOS 16 / Android 16, KernelSU) → iPad (iPadOS 27.3). See [docs](./docs) for details.
